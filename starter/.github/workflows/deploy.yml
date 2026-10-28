@@ -1,0 +1,75 @@
+# Every time something in src/ changes on main, this sends the code to Apps Script
+# and updates the web app. The app link stays the same.
+name: Deploy to Apps Script
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'deploy.json', '.clasp.json', 'tools/check.js']
+  workflow_dispatch:        # "Run workflow" button on the Actions tab
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check the code for mistakes before sending it
+        run: node tools/check.js
+
+      - name: Sign in to Google
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          if [ -z "$CLASPRC_JSON" ]; then echo "::error::The CLASPRC_JSON secret is missing."; exit 1; fi
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          chmod 600 ~/.clasprc.json
+
+      # Neither file is kept in the repo (.gitignore); they only go to Apps Script.
+      - name: Add the Gemini key and the app link
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "$GEMINI_API_KEY" ]; then
+            if printf '%s' "$GEMINI_API_KEY" | grep -qE '^[A-Za-z0-9_-]{20,}$'; then
+              printf "// Added by GitHub at deploy time – not stored in the repo.\nconst INJECTED_GEMINI_KEY = '%s';\n" "$GEMINI_API_KEY" > src/Secrets.gs
+            else
+              echo "::warning::GEMINI_API_KEY doesn't look like a key – skipped."
+            fi
+          fi
+          URL=$(jq -r '.appUrl // ""' deploy.json)
+          if [ -n "$URL" ]; then printf "// Added by GitHub from deploy.json.\nconst APP_LINK = '%s';\n" "$URL" > src/Link.gs; fi
+
+      - name: Send the code to Apps Script
+        run: |
+          if ! grep -q '"scriptId": *"[A-Za-z0-9_-]\{20,\}"' .clasp.json; then
+            echo "::error::.clasp.json has no Script ID."; exit 1
+          fi
+          npx --yes @google/clasp@3.4.1 push --force
+
+      - name: Update the web app (same link)
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          ID=$(jq -r '.deploymentId // ""' deploy.json)
+          if [ -z "$ID" ]; then echo "::warning::No deploymentId in deploy.json – code sent, app not updated."; exit 0; fi
+          npx --yes @google/clasp@3.4.1 update-deployment "$ID" --description "GitHub ${GITHUB_SHA::7} – $(printf '%s' "${COMMIT_MSG:-manual run}" | head -1 | cut -c1-80)"
+          {
+            echo "### ✅ App updated"
+            jq -r '.appUrl // ""' deploy.json
+            echo ""
+            echo "Close and reopen the app on your phone to see the changes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the sign-in and key files
+        if: always()
+        run: rm -f ~/.clasprc.json src/Secrets.gs src/Link.gs

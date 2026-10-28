@@ -1,0 +1,179 @@
+# Makes a brand-new app in one go: a private GitHub repo from the starter, a Google Sheet with the
+# Apps Script inside, the first web-app deployment, and the secrets the new repo needs to deploy itself.
+# Run it from Actions → "New app" → Run workflow. Afterwards: open the Sheet → menu → ▶ Start → Allow.
+name: New app
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "App name, e.g. Family Kitchen"
+        required: true
+      tagline:
+        description: "One line about what it does (optional)"
+        required: false
+      access:
+        description: "Who can open the phone app"
+        type: choice
+        options: ["Only me", "Anyone with a Google account"]
+        default: "Only me"
+      repo:
+        description: "GitHub repo name (optional – made from the app name)"
+        required: false
+
+permissions:
+  contents: write           # only to record the new app in apps.json here
+
+concurrency:
+  group: new-app
+  cancel-in-progress: false
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OWNER: ${{ github.repository_owner }}
+      CLASP: npx --yes @google/clasp@3.4.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check the inputs and secrets
+        env:
+          IN_NAME: ${{ inputs.name }}
+          IN_TAGLINE: ${{ inputs.tagline }}
+          IN_REPO: ${{ inputs.repo }}
+          IN_ACCESS: ${{ inputs.access }}
+          GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::error::The FACTORY_TOKEN secret is missing."; exit 1; }
+          [ -n "$CLASPRC_JSON" ] || { echo "::error::The CLASPRC_JSON secret is missing."; exit 1; }
+          [ -n "$GEMINI_API_KEY" ] || echo "::warning::No GEMINI_API_KEY secret – the app's AI will be off until a key is set in the Sheet."
+          NAME=$(printf '%s' "$IN_NAME" | tr -cd 'A-Za-z0-9 &.,()-' | sed -E 's/ +/ /g; s/^ //; s/ $//' | cut -c1-40)
+          TAGLINE=$(printf '%s' "$IN_TAGLINE" | tr -cd 'A-Za-z0-9 &.,()!?:+-' | sed -E 's/ +/ /g; s/^ //; s/ $//' | cut -c1-90)
+          [ -n "$NAME" ] || { echo "::error::Give the app a name (letters and numbers)."; exit 1; }
+          if [ -n "$IN_REPO" ]; then REPO="$IN_REPO"
+          else REPO=$(printf '%s' "$NAME" | tr -cd 'A-Za-z0-9 ' | awk '{for(i=1;i<=NF;i++) printf "%s%s", toupper(substr($i,1,1)), substr($i,2)}'); fi
+          printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9._-]{1,60}$' || { echo "::error::'$REPO' isn't a valid repo name."; exit 1; }
+          [ "$REPO" != "app-factory" ] || { echo "::error::Pick another repo name."; exit 1; }
+          if gh api "repos/$OWNER/$REPO" --silent 2>/dev/null; then
+            echo "::error::$OWNER/$REPO already exists – pick another app name or repo name."; exit 1
+          fi
+          ACCESS=MYSELF; [ "$IN_ACCESS" = "Anyone with a Google account" ] && ACCESS=ANYONE
+          { echo "NAME=$NAME"; echo "TAGLINE=$TAGLINE"; echo "REPO=$REPO"; echo "ACCESS=$ACCESS"; } >> "$GITHUB_ENV"
+          echo "Making \"$NAME\" in $OWNER/$REPO (app open to: $ACCESS)"
+
+      - name: Build the app's files from the starter
+        run: |
+          cp -r starter "$RUNNER_TEMP/app"
+          node tools/fill.js "$RUNNER_TEMP/app"
+          (cd "$RUNNER_TEMP/app" && node tools/check.js)
+
+      - name: Create the private GitHub repo and its secrets
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if ! out=$(gh api -X POST user/repos -f name="$REPO" -F private=true -f description="$NAME – Google Sheets + Apps Script app (made by app-factory)" 2>&1); then
+            echo "::error::Couldn't create the repo: $(echo "$out" | tail -3 | tr '\n' ' ') – check FACTORY_TOKEN has Administration: Read and write on All repositories."; exit 1
+          fi
+          echo "REPO_CREATED=1" >> "$GITHUB_ENV"
+          setsecret() {   # the new repo can take a few seconds to accept secrets
+            for _ in 1 2 3 4 5; do
+              if printf '%s' "$2" | gh secret set "$1" -R "$OWNER/$REPO" >/dev/null 2>&1; then echo "secret $1 set"; return 0; fi
+              sleep 3
+            done
+            echo "::error::Couldn't set the $1 secret – check FACTORY_TOKEN has Secrets: Read and write."; return 1
+          }
+          setsecret CLASPRC_JSON "$CLASPRC_JSON"
+          if [ -n "$GEMINI_API_KEY" ]; then setsecret GEMINI_API_KEY "$GEMINI_API_KEY"; fi
+
+      - name: Sign in to Google
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json && chmod 600 ~/.clasprc.json
+
+      - name: Create the Google Sheet with the app inside, and publish it
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          b="$RUNNER_TEMP/script"; mkdir -p "$b"
+          if ! out=$(cd "$b" && $CLASP create-script --type sheets --title "$NAME" --rootDir . 2>&1); then
+            echo "$out" | tail -15 | while IFS= read -r l; do echo "::error::create: $l"; done; exit 1; fi
+          SID=$(jq -r .scriptId "$b/.clasp.json")
+          PID=$(jq -r '(.parentId | if type == "array" then .[0] else . end) // ""' "$b/.clasp.json")
+          [ -n "$SID" ] && [ "$SID" != null ] || { echo "::error::No Script ID came back from Google."; exit 1; }
+          echo "SHEET_ID=$PID" >> "$GITHUB_ENV"
+          echo "SCRIPT_ID=$SID" >> "$GITHUB_ENV"
+          # only our files go up (clasp may have made a stub)
+          find "$b" -maxdepth 1 -type f ! -name .clasp.json -delete
+          cp "$RUNNER_TEMP/app/src/"* "$b/"
+          if [ -n "$GEMINI_API_KEY" ] && printf '%s' "$GEMINI_API_KEY" | grep -qE '^[A-Za-z0-9_-]{20,}$'; then
+            printf "// Added by GitHub at deploy time – not stored in the repo.\nconst INJECTED_GEMINI_KEY = '%s';\n" "$GEMINI_API_KEY" > "$b/Secrets.gs"
+          fi
+          if ! out=$(cd "$b" && $CLASP push --force 2>&1); then
+            echo "$out" | tail -15 | while IFS= read -r l; do echo "::error::push: $l"; done; exit 1; fi
+          DEP=$(cd "$b" && $CLASP create-deployment --description "First version" 2>&1 | grep -o 'AKfy[A-Za-z0-9_-]*' | head -1)
+          [ -n "$DEP" ] || { echo "::error::Couldn't create the web-app deployment."; exit 1; }
+          URL="https://script.google.com/macros/s/$DEP/exec"
+          # pin the link so emails sent by timers open the right app, then publish that version
+          printf "// Added by GitHub from deploy.json.\nconst APP_LINK = '%s';\n" "$URL" > "$b/Link.gs"
+          (cd "$b" && $CLASP push --force >/dev/null && $CLASP update-deployment "$DEP" --description "First version" >/dev/null)
+          { echo "DEP_ID=$DEP"; echo "APP_URL=$URL"; } >> "$GITHUB_ENV"
+
+      - name: Save the links in the new repo and push it
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/app"
+          jq -n --arg s "$SCRIPT_ID" '{scriptId:$s, rootDir:"src", scriptExtensions:[".gs",".js"], htmlExtensions:[".html"]}' > .clasp.json
+          jq -n --arg d "$DEP_ID" --arg u "$APP_URL" --arg s "$SCRIPT_ID" --arg p "$SHEET_ID" \
+            '{deploymentId:$d, appUrl:$u, sheetUrl:("https://docs.google.com/spreadsheets/d/"+$p+"/edit"), scriptId:$s, sheetId:$p}' > deploy.json
+          git init -q -b main
+          git add -A
+          git -c user.name="app-factory" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "New app: $NAME (from app-factory)"
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/$OWNER/$REPO.git" main
+
+      - name: Record the app in apps.json
+        run: |
+          [ -s apps.json ] || echo '[]' > apps.json
+          jq --arg n "$NAME" --arg r "$OWNER/$REPO" --arg u "$APP_URL" --arg p "$SHEET_ID" --arg d "$(date -u +%F)" \
+            '. + [{name:$n, repo:$r, appUrl:$u, sheetUrl:("https://docs.google.com/spreadsheets/d/"+$p+"/edit"), created:$d}]' apps.json > apps.tmp && mv apps.tmp apps.json
+          git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps.json && git commit -qm "Add $NAME to apps.json" && git pull -q --rebase && git push -q
+
+      - name: Summary
+        run: |
+          {
+            echo "### ✅ $NAME is made"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Sheet | https://docs.google.com/spreadsheets/d/$SHEET_ID/edit |"
+            echo "| Phone app | $APP_URL |"
+            echo "| Code | https://github.com/$OWNER/$REPO |"
+            echo ""
+            echo "**One step left:** open the Sheet, wait a few seconds for the **$NAME** menu, choose **▶ Start / repair** and click **Allow**."
+            echo "It builds the tabs, checks the AI and emails you the app link to add to your phone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: If something went wrong
+        if: failure()
+        run: |
+          {
+            echo "### ❌ $NAME wasn't finished"
+            [ "${REPO_CREATED:-}" = 1 ] && echo "- The repo **$OWNER/$REPO** was created – delete it (Settings → Delete) before running again with the same name."
+            [ -n "${SHEET_ID:-}" ] && echo "- A Sheet was created: https://docs.google.com/spreadsheets/d/$SHEET_ID/edit – delete it from Drive."
+            echo "- The red step above says what went wrong."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the sign-in file
+        if: always()
+        run: rm -f ~/.clasprc.json && rm -rf "$RUNNER_TEMP/script"

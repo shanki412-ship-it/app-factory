@@ -1,0 +1,30 @@
+# Checks the starter on every change to app-factory: fills it with test values and runs the
+# same code checker every new app uses. Doesn't touch Google or create anything.
+name: Test starter
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Fill the starter and check it
+        env:
+          NAME: Test App
+          TAGLINE: Checks the starter works
+          REPO: TestApp
+          OWNER: ${{ github.repository_owner }}
+          ACCESS: MYSELF
+        run: |
+          cp -r starter "$RUNNER_TEMP/app"
+          node tools/fill.js "$RUNNER_TEMP/app"
+          cd "$RUNNER_TEMP/app" && node tools/check.js
